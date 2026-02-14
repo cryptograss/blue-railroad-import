@@ -18,6 +18,46 @@ class TokenInfo:
     owner_display: str
 
 
+def parse_smw_token_response(data: dict) -> list[TokenInfo]:
+    """Parse SMW API response into list of TokenInfo.
+
+    Expects the response format from an SMW ask query like:
+    [[IPFS CID::cid]]|?Token ID|?Owner Address|?Owner
+
+    Args:
+        data: The JSON response from SMW API
+
+    Returns:
+        List of TokenInfo objects for tokens found
+    """
+    results = []
+    query_results = data.get('query', {}).get('results', {})
+
+    for page_title, page_data in query_results.items():
+        printouts = page_data.get('printouts', {})
+
+        # Extract Token ID
+        token_id_list = printouts.get('Token ID', [])
+        token_id = token_id_list[0].get('fulltext', '') if token_id_list else ''
+
+        # Extract Owner Address
+        owner_addr_list = printouts.get('Owner Address', [])
+        owner_address = owner_addr_list[0].get('fulltext', '') if owner_addr_list else ''
+
+        # Extract Owner (display name), fall back to address
+        owner_list = printouts.get('Owner', [])
+        owner_display = owner_list[0].get('fulltext', '') if owner_list else owner_address
+
+        if token_id:
+            results.append(TokenInfo(
+                token_id=token_id,
+                owner_address=owner_address,
+                owner_display=owner_display,
+            ))
+
+    return results
+
+
 def _parse_template_params(wikitext: str) -> dict[str, str]:
     """Extract template parameters from wikitext for diffing."""
     params = {}
@@ -199,32 +239,7 @@ class MWClientWrapper:
             print(f"SMW query failed for CID {ipfs_cid}: {e}")
             return []
 
-        results = []
-        query_results = data.get('query', {}).get('results', {})
-
-        for page_title, page_data in query_results.items():
-            printouts = page_data.get('printouts', {})
-
-            # Extract Token ID
-            token_id_list = printouts.get('Token ID', [])
-            token_id = token_id_list[0].get('fulltext', '') if token_id_list else ''
-
-            # Extract Owner Address
-            owner_addr_list = printouts.get('Owner Address', [])
-            owner_address = owner_addr_list[0].get('fulltext', '') if owner_addr_list else ''
-
-            # Extract Owner (display name)
-            owner_list = printouts.get('Owner', [])
-            owner_display = owner_list[0].get('fulltext', '') if owner_list else owner_address
-
-            if token_id:
-                results.append(TokenInfo(
-                    token_id=token_id,
-                    owner_address=owner_address,
-                    owner_display=owner_display,
-                ))
-
-        return results
+        return parse_smw_token_response(data)
 
 
 class DryRunClient:
@@ -328,28 +343,6 @@ class DryRunClient:
                 print(f"[DRY RUN] SMW query failed for CID {ipfs_cid}: {e}")
                 return []
 
-            results = []
-            query_results = data.get('query', {}).get('results', {})
-
-            for page_title, page_data in query_results.items():
-                printouts = page_data.get('printouts', {})
-
-                token_id_list = printouts.get('Token ID', [])
-                token_id = token_id_list[0].get('fulltext', '') if token_id_list else ''
-
-                owner_addr_list = printouts.get('Owner Address', [])
-                owner_address = owner_addr_list[0].get('fulltext', '') if owner_addr_list else ''
-
-                owner_list = printouts.get('Owner', [])
-                owner_display = owner_list[0].get('fulltext', '') if owner_list else owner_address
-
-                if token_id:
-                    results.append(TokenInfo(
-                        token_id=token_id,
-                        owner_address=owner_address,
-                        owner_display=owner_display,
-                    ))
-
-            return results
+            return parse_smw_token_response(data)
 
         return []
