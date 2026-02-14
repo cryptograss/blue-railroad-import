@@ -162,7 +162,7 @@ class TestParseSubmissionContent:
         assert sub.ipfs_cid == 'QmTest123abc'
         assert sub.token_ids == [5, 6, 7]
         assert sub.status == 'Minted'
-        assert sub.is_minted is True
+        assert sub.is_minted is True  # True because token_ids is non-empty
 
     def test_parses_participants_wallet_only(self):
         wikitext = """{{Blue Railroad Submission

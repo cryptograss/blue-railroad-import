@@ -135,17 +135,18 @@ class TestOwnerStats:
 class TestSubmission:
     """Tests for Submission model."""
 
-    def test_is_minted_when_status_minted(self):
-        sub = Submission(id=1, status='Minted')
+    def test_is_minted_when_has_token_ids(self):
+        sub = Submission(id=1, token_ids=[5, 6])
         assert sub.is_minted is True
 
-    def test_is_not_minted_when_status_pending(self):
-        sub = Submission(id=1, status='Pending')
+    def test_is_not_minted_when_no_token_ids(self):
+        sub = Submission(id=1, token_ids=[])
         assert sub.is_minted is False
 
-    def test_is_minted_case_insensitive(self):
-        sub = Submission(id=1, status='minted')
-        assert sub.is_minted is True
+    def test_is_not_minted_with_status_but_no_tokens(self):
+        # Status alone doesn't make it minted - need actual token IDs
+        sub = Submission(id=1, status='Minted', token_ids=[])
+        assert sub.is_minted is False
 
     def test_has_cid_when_cid_present(self):
         sub = Submission(id=1, ipfs_cid='QmTest123')

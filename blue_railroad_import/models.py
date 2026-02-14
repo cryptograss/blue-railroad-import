@@ -186,7 +186,8 @@ class Submission:
 
     @property
     def is_minted(self) -> bool:
-        return self.status.lower() == 'minted'
+        """A submission is minted if it has any token IDs associated with it."""
+        return bool(self.token_ids)
 
     @property
     def has_cid(self) -> bool:

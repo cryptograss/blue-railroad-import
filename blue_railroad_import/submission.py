@@ -3,6 +3,8 @@
 import re
 from typing import Optional, Tuple
 
+import mwparserfromhell
+
 from .models import Submission, Token
 from .wiki_client import WikiClientProtocol, SaveResult
 
@@ -152,47 +154,61 @@ def update_submission_token_id(
     return wiki_client.save_page(page_title, updated_content, summary)
 
 
+def _get_template_param(template, param_name: str) -> Optional[str]:
+    """Get a parameter value from a mwparserfromhell template, or None if not present."""
+    if template.has(param_name):
+        return str(template.get(param_name).value).strip()
+    return None
+
+
 def parse_submission_content(wikitext: str, submission_id: int) -> Submission:
-    """Parse submission page wikitext into a Submission object."""
-    # Extract main template fields
-    exercise_match = re.search(r'\|exercise=([^\n|}]+)', wikitext)
-    video_match = re.search(r'\|video=([^\n|}]+)', wikitext)
-    block_height_match = re.search(r'\|block_height=(\d+)', wikitext)
-    status_match = re.search(r'\|status=([^\n|}]+)', wikitext)
-    ipfs_cid_match = re.search(r'\|ipfs_cid=([^\n|}]+)', wikitext)
-    token_ids_match = re.search(r'\|token_ids=([^\n|}]+)', wikitext)
+    """Parse submission page wikitext into a Submission object using mwparserfromhell."""
+    parsed = mwparserfromhell.parse(wikitext)
+    templates = parsed.filter_templates()
 
-    # Parse token_ids from comma-separated string
+    # Find the main submission template
+    exercise = ''
+    video = None
+    block_height = None
+    status = 'Pending'
+    ipfs_cid = None
     token_ids = []
-    if token_ids_match:
-        token_ids_str = token_ids_match.group(1).strip()
-        if token_ids_str:
-            for tid in token_ids_str.split(','):
-                tid = tid.strip()
-                if tid.isdigit():
-                    token_ids.append(int(tid))
-
-    # Extract participant wallets
     participants = []
-    # Match wallet-only format
-    wallet_only_pattern = r'\{\{Blue Railroad Participant\s*\|wallet=([^\n|}]+)\s*\}\}'
-    for match in re.finditer(wallet_only_pattern, wikitext, re.IGNORECASE):
-        participants.append(match.group(1).strip())
 
-    # Match name+wallet format (for backwards compat)
-    name_wallet_pattern = r'\{\{Blue Railroad Participant\s*\|name=[^\n|}]+\s*\|wallet=([^\n|}]+)\s*\}\}'
-    for match in re.finditer(name_wallet_pattern, wikitext, re.IGNORECASE):
-        wallet = match.group(1).strip()
-        if wallet not in participants:
-            participants.append(wallet)
+    for template in templates:
+        template_name = str(template.name).strip().lower()
+
+        if template_name == 'blue railroad submission':
+            exercise = _get_template_param(template, 'exercise') or ''
+            video = _get_template_param(template, 'video')
+
+            block_height_str = _get_template_param(template, 'block_height')
+            if block_height_str and block_height_str.isdigit():
+                block_height = int(block_height_str)
+
+            status = _get_template_param(template, 'status') or 'Pending'
+            ipfs_cid = _get_template_param(template, 'ipfs_cid')
+
+            # Parse token_ids from comma-separated string
+            token_ids_str = _get_template_param(template, 'token_ids')
+            if token_ids_str:
+                for tid in token_ids_str.split(','):
+                    tid = tid.strip()
+                    if tid.isdigit():
+                        token_ids.append(int(tid))
+
+        elif template_name == 'blue railroad participant':
+            wallet = _get_template_param(template, 'wallet')
+            if wallet and wallet not in participants:
+                participants.append(wallet)
 
     return Submission(
         id=submission_id,
-        exercise=exercise_match.group(1).strip() if exercise_match else '',
-        video=video_match.group(1).strip() if video_match else None,
-        block_height=int(block_height_match.group(1)) if block_height_match else None,
-        status=status_match.group(1).strip() if status_match else 'Pending',
-        ipfs_cid=ipfs_cid_match.group(1).strip() if ipfs_cid_match else None,
+        exercise=exercise,
+        video=video,
+        block_height=block_height,
+        status=status,
+        ipfs_cid=ipfs_cid,
         token_ids=token_ids,
         participants=participants,
     )
