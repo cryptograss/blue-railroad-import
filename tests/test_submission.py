@@ -12,9 +12,11 @@ from blue_railroad_import.submission import (
     match_tokens_to_submissions,
     get_submission_id_for_token,
     update_submission_token_ids,
+    find_tokens_for_submission,
+    match_submissions_via_smw,
 )
 from blue_railroad_import.models import Submission, Token
-from blue_railroad_import.wiki_client import DryRunClient, SaveResult
+from blue_railroad_import.wiki_client import DryRunClient, SaveResult, TokenInfo
 
 
 class TestGetSubmissionPageTitle:
@@ -434,3 +436,96 @@ class TestUpdateSubmissionTokenIds:
 
         assert result.action == 'error'
         assert 'not found' in result.message.lower()
+
+
+class TestFindTokensForSubmission:
+    """Tests for SMW-based token lookup."""
+
+    def test_finds_tokens_by_cid(self):
+        mock_cid_tokens = {
+            'QmTestCid123': [
+                TokenInfo(token_id='10', owner_address='0x123', owner_display='alice.eth'),
+                TokenInfo(token_id='11', owner_address='0x456', owner_display='bob.eth'),
+            ]
+        }
+        client = DryRunClient(existing_pages={}, mock_cid_tokens=mock_cid_tokens)
+        submission = Submission(id=1, ipfs_cid='QmTestCid123')
+
+        tokens = find_tokens_for_submission(client, submission)
+
+        assert len(tokens) == 2
+        assert ('10', '0x123', 'alice.eth') in tokens
+        assert ('11', '0x456', 'bob.eth') in tokens
+
+    def test_returns_empty_when_no_cid(self):
+        client = DryRunClient(existing_pages={})
+        submission = Submission(id=1, ipfs_cid=None)
+
+        tokens = find_tokens_for_submission(client, submission)
+
+        assert tokens == []
+
+    def test_returns_empty_when_no_matches(self):
+        mock_cid_tokens = {
+            'QmOtherCid': [TokenInfo(token_id='5', owner_address='0x999', owner_display='other')]
+        }
+        client = DryRunClient(existing_pages={}, mock_cid_tokens=mock_cid_tokens)
+        submission = Submission(id=1, ipfs_cid='QmUnmatchedCid')
+
+        tokens = find_tokens_for_submission(client, submission)
+
+        assert tokens == []
+
+
+class TestMatchSubmissionsViaSMW:
+    """Tests for SMW-based token-to-submission matching."""
+
+    def test_matches_multiple_submissions(self):
+        mock_cid_tokens = {
+            'QmCid1': [
+                TokenInfo(token_id='10', owner_address='0x123', owner_display='alice'),
+            ],
+            'QmCid2': [
+                TokenInfo(token_id='20', owner_address='0x456', owner_display='bob'),
+                TokenInfo(token_id='21', owner_address='0x789', owner_display='carol'),
+            ],
+        }
+        client = DryRunClient(existing_pages={}, mock_cid_tokens=mock_cid_tokens)
+        submissions = [
+            Submission(id=1, ipfs_cid='QmCid1'),
+            Submission(id=2, ipfs_cid='QmCid2'),
+            Submission(id=3, ipfs_cid=None),  # No CID, should be skipped
+        ]
+
+        result = match_submissions_via_smw(client, submissions)
+
+        assert result == {
+            1: [10],
+            2: [20, 21],
+        }
+
+    def test_skips_submissions_without_cid(self):
+        client = DryRunClient(existing_pages={})
+        submissions = [
+            Submission(id=1, ipfs_cid=None),
+            Submission(id=2, ipfs_cid=''),
+        ]
+
+        result = match_submissions_via_smw(client, submissions)
+
+        assert result == {}
+
+    def test_returns_sorted_token_ids(self):
+        mock_cid_tokens = {
+            'QmTestCid': [
+                TokenInfo(token_id='25', owner_address='0x1', owner_display='a'),
+                TokenInfo(token_id='10', owner_address='0x2', owner_display='b'),
+                TokenInfo(token_id='15', owner_address='0x3', owner_display='c'),
+            ],
+        }
+        client = DryRunClient(existing_pages={}, mock_cid_tokens=mock_cid_tokens)
+        submissions = [Submission(id=1, ipfs_cid='QmTestCid')]
+
+        result = match_submissions_via_smw(client, submissions)
+
+        assert result[1] == [10, 15, 25]  # Sorted

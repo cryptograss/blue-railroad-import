@@ -356,3 +356,49 @@ def get_submission_id_for_token(
             return sub.id
 
     return None
+
+
+def find_tokens_for_submission(
+    wiki_client: WikiClientProtocol,
+    submission: Submission,
+) -> list[tuple[str, str, str]]:
+    """Find all tokens for a submission using Semantic MediaWiki query.
+
+    Queries the wiki's SMW API for token pages with matching IPFS CID.
+
+    Returns list of (token_id, owner_address, owner_display) tuples.
+    """
+    if not submission.ipfs_cid:
+        return []
+
+    tokens = wiki_client.query_tokens_by_cid(submission.ipfs_cid)
+    return [(t.token_id, t.owner_address, t.owner_display) for t in tokens]
+
+
+def match_submissions_via_smw(
+    wiki_client: WikiClientProtocol,
+    submissions: list[Submission],
+    verbose: bool = False,
+) -> dict[int, list[int]]:
+    """Match tokens to submissions using Semantic MediaWiki queries.
+
+    For each submission with an IPFS CID, queries the wiki for token pages
+    that have the same CID. This uses the wiki's indexed semantic data
+    rather than loading all tokens into Python.
+
+    Returns a dict mapping submission_id -> list of token_ids.
+    """
+    result: dict[int, list[int]] = {}
+
+    for sub in submissions:
+        if not sub.ipfs_cid:
+            continue
+
+        tokens = wiki_client.query_tokens_by_cid(sub.ipfs_cid)
+        if tokens:
+            token_ids = [int(t.token_id) for t in tokens]
+            result[sub.id] = sorted(token_ids)
+            if verbose:
+                print(f"  Submission {sub.id}: found {len(tokens)} tokens via SMW")
+
+    return result
