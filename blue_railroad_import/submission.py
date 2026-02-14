@@ -3,10 +3,12 @@
 import re
 from typing import Optional, Tuple
 
+from .models import Submission, Token
 from .wiki_client import WikiClientProtocol, SaveResult
 
 
 SUBMISSION_PAGE_PREFIX = 'Blue Railroad Submission/'
+MAX_SUBMISSION_ID = 20  # Check submissions 1-20
 
 
 def get_submission_page_title(submission_id: int) -> str:
@@ -148,3 +150,193 @@ def update_submission_token_id(
 
     summary = f"Mark as minted: Token #{token_id} to {participant_wallet[:10]}..."
     return wiki_client.save_page(page_title, updated_content, summary)
+
+
+def parse_submission_content(wikitext: str, submission_id: int) -> Submission:
+    """Parse submission page wikitext into a Submission object."""
+    # Extract main template fields
+    exercise_match = re.search(r'\|exercise=([^\n|}]+)', wikitext)
+    video_match = re.search(r'\|video=([^\n|}]+)', wikitext)
+    block_height_match = re.search(r'\|block_height=(\d+)', wikitext)
+    status_match = re.search(r'\|status=([^\n|}]+)', wikitext)
+    ipfs_cid_match = re.search(r'\|ipfs_cid=([^\n|}]+)', wikitext)
+    token_ids_match = re.search(r'\|token_ids=([^\n|}]+)', wikitext)
+
+    # Parse token_ids from comma-separated string
+    token_ids = []
+    if token_ids_match:
+        token_ids_str = token_ids_match.group(1).strip()
+        if token_ids_str:
+            for tid in token_ids_str.split(','):
+                tid = tid.strip()
+                if tid.isdigit():
+                    token_ids.append(int(tid))
+
+    # Extract participant wallets
+    participants = []
+    # Match wallet-only format
+    wallet_only_pattern = r'\{\{Blue Railroad Participant\s*\|wallet=([^\n|}]+)\s*\}\}'
+    for match in re.finditer(wallet_only_pattern, wikitext, re.IGNORECASE):
+        participants.append(match.group(1).strip())
+
+    # Match name+wallet format (for backwards compat)
+    name_wallet_pattern = r'\{\{Blue Railroad Participant\s*\|name=[^\n|}]+\s*\|wallet=([^\n|}]+)\s*\}\}'
+    for match in re.finditer(name_wallet_pattern, wikitext, re.IGNORECASE):
+        wallet = match.group(1).strip()
+        if wallet not in participants:
+            participants.append(wallet)
+
+    return Submission(
+        id=submission_id,
+        exercise=exercise_match.group(1).strip() if exercise_match else '',
+        video=video_match.group(1).strip() if video_match else None,
+        block_height=int(block_height_match.group(1)) if block_height_match else None,
+        status=status_match.group(1).strip() if status_match else 'Pending',
+        ipfs_cid=ipfs_cid_match.group(1).strip() if ipfs_cid_match else None,
+        token_ids=token_ids,
+        participants=participants,
+    )
+
+
+def fetch_submission(
+    wiki_client: WikiClientProtocol,
+    submission_id: int,
+) -> Optional[Submission]:
+    """Fetch a single submission from the wiki."""
+    page_title = get_submission_page_title(submission_id)
+    content = wiki_client.get_page_content(page_title)
+
+    if content is None:
+        return None
+
+    return parse_submission_content(content, submission_id)
+
+
+def fetch_all_submissions(
+    wiki_client: WikiClientProtocol,
+    max_id: int = MAX_SUBMISSION_ID,
+    verbose: bool = False,
+) -> list[Submission]:
+    """Fetch all submissions from the wiki (pages 1 through max_id)."""
+    submissions = []
+
+    for i in range(1, max_id + 1):
+        submission = fetch_submission(wiki_client, i)
+        if submission:
+            submissions.append(submission)
+            if verbose:
+                print(f"  Loaded submission #{i}: {submission.exercise}")
+
+    return submissions
+
+
+def update_submission_token_ids(
+    wiki_client: WikiClientProtocol,
+    submission_id: int,
+    token_ids: list[int],
+    verbose: bool = False,
+) -> SaveResult:
+    """Update a submission page with the list of minted token IDs.
+
+    Also sets status to 'Minted' if there are any token IDs.
+
+    Args:
+        wiki_client: Wiki client for reading/writing pages
+        submission_id: The submission number
+        token_ids: List of token IDs minted from this submission
+        verbose: Print progress messages
+
+    Returns:
+        SaveResult indicating what happened
+    """
+    page_title = get_submission_page_title(submission_id)
+
+    if verbose:
+        print(f"Updating {page_title} with token IDs: {token_ids}")
+
+    current_content = wiki_client.get_page_content(page_title)
+
+    if current_content is None:
+        return SaveResult(page_title, 'error', f'Page not found: {page_title}')
+
+    # Sort and format token IDs
+    sorted_ids = sorted(set(token_ids))
+    token_ids_str = ','.join(str(tid) for tid in sorted_ids)
+
+    try:
+        # Update token_ids field
+        updated_content, changed1 = update_submission_field(
+            current_content,
+            'token_ids',
+            token_ids_str,
+        )
+
+        # Also update status to Minted if we have tokens
+        changed2 = False
+        if token_ids:
+            updated_content, changed2 = update_submission_field(
+                updated_content,
+                'status',
+                'Minted',
+            )
+
+    except ValueError as e:
+        return SaveResult(page_title, 'error', str(e))
+
+    if not changed1 and not changed2:
+        return SaveResult(page_title, 'unchanged', 'Token IDs and status already set')
+
+    summary = f"Update minted tokens: {token_ids_str}"
+    return wiki_client.save_page(page_title, updated_content, summary)
+
+
+def match_tokens_to_submissions(
+    tokens: dict[str, Token],
+    submissions: list[Submission],
+) -> dict[int, list[int]]:
+    """Match tokens to submissions based on IPFS CID.
+
+    Returns a dict mapping submission_id -> list of token_ids.
+    Multiple tokens can match the same submission (one per participant).
+    """
+    # Build a lookup from CID to submission
+    cid_to_submission: dict[str, Submission] = {}
+    for sub in submissions:
+        if sub.ipfs_cid:
+            cid_to_submission[sub.ipfs_cid] = sub
+
+    # Match tokens to submissions
+    submission_tokens: dict[int, list[int]] = {}
+
+    for token_id_str, token in tokens.items():
+        token_cid = token.ipfs_cid
+        if not token_cid:
+            continue
+
+        # Check if this CID matches a submission
+        if token_cid in cid_to_submission:
+            sub = cid_to_submission[token_cid]
+            if sub.id not in submission_tokens:
+                submission_tokens[sub.id] = []
+            submission_tokens[sub.id].append(int(token_id_str))
+
+    return submission_tokens
+
+
+def get_submission_id_for_token(
+    token: Token,
+    submissions: list[Submission],
+) -> Optional[int]:
+    """Get the submission ID that matches a token's CID.
+
+    Returns None if no matching submission found.
+    """
+    token_cid = token.ipfs_cid
+    if not token_cid:
+        return None
+
+    for sub in submissions:
+        if sub.ipfs_cid == token_cid:
+            return sub.id
+
+    return None

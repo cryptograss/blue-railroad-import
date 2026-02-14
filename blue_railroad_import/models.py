@@ -170,3 +170,24 @@ class BotConfig:
     """Complete bot configuration from wiki page."""
     sources: list[Source] = field(default_factory=list)
     leaderboards: list[LeaderboardConfig] = field(default_factory=list)
+
+
+@dataclass
+class Submission:
+    """A Blue Railroad submission from PickiPedia."""
+    id: int
+    exercise: str = ''
+    video: Optional[str] = None
+    block_height: Optional[int] = None
+    status: str = 'Pending'
+    ipfs_cid: Optional[str] = None
+    token_ids: list[int] = field(default_factory=list)
+    participants: list[str] = field(default_factory=list)  # wallet addresses
+
+    @property
+    def is_minted(self) -> bool:
+        return self.status.lower() == 'minted'
+
+    @property
+    def has_cid(self) -> bool:
+        return self.ipfs_cid is not None and len(self.ipfs_cid) > 0
