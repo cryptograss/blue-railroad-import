@@ -1,0 +1,282 @@
+"""Process completed ReleaseDraft pages into Release pages.
+
+Queries the ReleaseDraft namespace (3006) for drafts that have been
+finalized (pinned to IPFS). For each one that doesn't already have a
+corresponding Release page, creates it.
+
+The edit summary of the finalization edit contains the CID
+(e.g. "Finalized: pinned to IPFS as bafybeif..."), which is the
+primary way we discover the CID for a completed draft.
+
+This module is the sole creator of Release pages — browser JS and
+Special pages only create ReleaseDraft pages.
+"""
+
+import json
+import urllib.request
+import urllib.parse
+import re
+from typing import Optional
+
+import yaml
+
+from .wiki_client import WikiClientProtocol, SaveResult
+
+
+NS_RELEASEDRAFT = 3006
+
+
+# -- Draft type classes --
+# Each draft type knows how to build its own Release page YAML.
+# The type field is set by whichever Special page or bot created the draft:
+#   Special:UploadAlbum   → type: record
+#   Special:UploadContent → type: other
+#   Blue Railroad bot     → type: blue-railroad
+
+
+class DraftType:
+    """Base class for draft type handlers."""
+
+    name: str = 'unknown'
+
+    def build_release(self, draft_data: dict) -> dict:
+        """Build Release page fields from draft data. Override in subclasses."""
+        return {}
+
+
+class RecordDraft(DraftType):
+    """Album, EP, single — any collection of tracks."""
+
+    name = 'record'
+
+    def build_release(self, draft_data: dict) -> dict:
+        release = {}
+        album = draft_data.get('album', {})
+        artist = album.get('artist', '')
+        title = album.get('title', '')
+        version = album.get('version', '')
+
+        full_title = f"{artist} - {title}" if artist and title else title or ''
+        if version:
+            full_title += f" ({version})"
+
+        if full_title:
+            release['title'] = full_title
+        if album.get('description'):
+            release['description'] = album['description']
+
+        return release
+
+
+class BlueRailroadDraft(DraftType):
+    """Video from a Blue Railroad on-chain submission."""
+
+    name = 'blue-railroad'
+
+    def build_release(self, draft_data: dict) -> dict:
+        release = {}
+        if draft_data.get('submission_id'):
+            release['title'] = f"Blue Railroad Submission {draft_data['submission_id']}"
+            release['description'] = f"Video from Blue Railroad Submission #{draft_data['submission_id']}"
+        release['file_type'] = 'video/webm'
+        return release
+
+
+class OtherDraft(DraftType):
+    """Catch-all for uploads that aren't records or Blue Railroad submissions."""
+
+    name = 'other'
+
+    def build_release(self, draft_data: dict) -> dict:
+        release = {}
+        content = draft_data.get('content', {})
+        if content.get('title'):
+            release['title'] = content['title']
+        if content.get('description'):
+            release['description'] = content['description']
+        if content.get('file_type'):
+            release['file_type'] = content['file_type']
+        if content.get('subsequent_to'):
+            release['subsequent_to'] = content['subsequent_to']
+        return release
+
+
+DRAFT_TYPES: dict[str, DraftType] = {
+    'record': RecordDraft(),
+    'album': RecordDraft(),  # legacy alias
+    'blue-railroad': BlueRailroadDraft(),
+    'other': OtherDraft(),
+    'content': OtherDraft(),  # legacy alias
+}
+
+
+def get_draft_handler(draft_data: dict) -> DraftType:
+    """Get the appropriate handler for a draft's type."""
+    type_name = draft_data.get('type', 'other')
+    return DRAFT_TYPES.get(type_name, OtherDraft())
+
+
+def fetch_release_drafts(wiki, verbose: bool = False) -> list[dict]:
+    """Fetch all ReleaseDraft pages and their content.
+
+    Returns list of dicts with 'title' and 'data' (parsed YAML).
+    """
+    api_url = f"{wiki._api_url}?action=query&list=allpages&apnamespace={NS_RELEASEDRAFT}&aplimit=500&format=json"
+
+    try:
+        with urllib.request.urlopen(api_url, timeout=30) as response:
+            result = json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        if verbose:
+            print(f"  Failed to query ReleaseDraft pages: {e}")
+        return []
+
+    all_pages = result.get('query', {}).get('allpages', [])
+
+    if verbose:
+        print(f"  Found {len(all_pages)} ReleaseDraft page(s)")
+
+    drafts = []
+    content_calls = 0
+    for page_info in all_pages:
+        title = page_info['title']
+        content = wiki.get_page_content(title)
+        content_calls += 1
+        if not content:
+            continue
+
+        try:
+            data = yaml.safe_load(content)
+            if not isinstance(data, dict):
+                if verbose:
+                    print(f"  {title}: YAML parsed but not a dict, skipping")
+                continue
+        except yaml.YAMLError as e:
+            if verbose:
+                print(f"  {title}: invalid YAML, skipping: {e}")
+            continue
+
+        drafts.append({
+            'title': title,
+            'data': data,
+        })
+
+    if verbose:
+        print(f"  ReleaseDraft API calls: 1 allpages + {content_calls} content = {1 + content_calls} total")
+
+    return drafts
+
+
+def find_cid_from_history(wiki, page_title: str, verbose: bool = False) -> Optional[str]:
+    """Try to find a CID from the page's edit history.
+
+    Looks for edit summaries like "Finalized: pinned to IPFS as bafybeif..."
+    or "Transcoding submitted: job coconut-..."
+    """
+    # Use the revisions API to get recent edit summaries
+    encoded_title = urllib.parse.quote(page_title)
+    url = (
+        f"{wiki._api_url}?action=query&titles={encoded_title}"
+        f"&prop=revisions&rvprop=comment&rvlimit=10&format=json"
+    )
+
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except Exception:
+        return None
+
+    pages = data.get('query', {}).get('pages', {})
+    for page_data in pages.values():
+        revisions = page_data.get('revisions', [])
+        for rev in revisions:
+            comment = rev.get('comment', '')
+            # Match "Finalized: pinned to IPFS as {cid}"
+            match = re.search(r'pinned to IPFS as (\S+)', comment)
+            if match:
+                return match.group(1)
+
+    return None
+
+
+def build_release_from_draft(draft_data: dict) -> str:
+    """Build Release page YAML from a ReleaseDraft's data."""
+    handler = get_draft_handler(draft_data)
+    release = handler.build_release(draft_data)
+
+    if draft_data.get('blockheight'):
+        release['blockheight'] = draft_data['blockheight']
+
+    release['pinned_on'] = ['delivery-kid']
+
+    return yaml.dump(release, default_flow_style=False, allow_unicode=True)
+
+
+def process_release_drafts(
+    wiki: WikiClientProtocol,
+    verbose: bool = False,
+) -> list[SaveResult]:
+    """Process completed ReleaseDraft pages into Release pages.
+
+    For each ReleaseDraft:
+    1. Check edit history for a finalization CID
+    2. If CID found and no Release:{CID} page exists, create it
+    3. Skip drafts that haven't been finalized yet
+
+    Returns list of SaveResult for Release pages created/enriched.
+    """
+    results = []
+
+    if verbose:
+        print("Processing ReleaseDraft pages...")
+
+    drafts = fetch_release_drafts(wiki, verbose=verbose)
+
+    history_calls = 0
+    for draft in drafts:
+        title = draft['title']
+        data = draft['data']
+
+        # Try to find the CID from edit history
+        cid = find_cid_from_history(wiki, title, verbose=verbose)
+        history_calls += 1
+
+        if not cid:
+            if verbose:
+                print(f"  {title}: no CID found in history, skipping")
+            continue
+
+        release_title = f"Release:{cid}"
+
+        if wiki.page_exists(release_title):
+            if verbose:
+                print(f"  {title}: Release page already exists ({release_title})")
+            results.append(SaveResult(release_title, 'unchanged', 'Already exists'))
+            continue
+
+        # Build Release page from draft data
+        release_yaml = build_release_from_draft(data)
+
+        if verbose:
+            print(f"  {title}: creating {release_title}")
+
+        handler = get_draft_handler(data)
+        summary = f"Release created from {handler.name} draft (via bot)"
+        result = wiki.save_page(release_title, release_yaml, summary)
+        results.append(result)
+
+        if result.action == 'created':
+            if verbose:
+                print(f"    Created: {release_title}")
+        elif result.action == 'error':
+            if verbose:
+                print(f"    ERROR: {result.message}")
+
+    if verbose:
+        n_drafts = len(drafts)
+        allpages_calls = 1
+        content_calls = n_drafts
+        total = allpages_calls + content_calls + history_calls
+        print(f"  ReleaseDraft API calls: {allpages_calls} allpages + {content_calls} content + {history_calls} history = {total} total")
+
+    return results
